@@ -1,5 +1,5 @@
-using NTG.Agent.WebClient.Client.Pages;
 using NTG.Agent.WebClient.Components;
+using NTG.Agent.WebClient.Services;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -10,9 +10,12 @@ builder.Services.AddRazorComponents()
     .AddInteractiveServerComponents()
     .AddInteractiveWebAssemblyComponents();
 
-var app = builder.Build();
+builder.Services.AddHttpClient<ChatClient>(client =>
+{
+    client.BaseAddress = new("https+http://ntg-agent-orchestrator"); ;
+});
 
-app.MapDefaultEndpoints();
+var app = builder.Build();
 
 // Configure the HTTP request pipeline.
 if (app.Environment.IsDevelopment())
@@ -37,4 +40,5 @@ app.MapRazorComponents<App>()
     .AddInteractiveWebAssemblyRenderMode()
     .AddAdditionalAssemblies(typeof(NTG.Agent.WebClient.Client._Imports).Assembly);
 
+app.MapDefaultEndpoints();
 app.Run();
