@@ -27,7 +27,7 @@ public class ConversationsController : ControllerBase
         return await _context.Conversations
             .Where(c => c.UserId == User.GetUserId())
             .OrderByDescending(c => c.UpdatedAt)
-            .Select(c => new ConversationListItem (c.Id, c.Name))
+            .Select(c => new ConversationListItem(c.Id, c.Name))
             .ToListAsync();
     }
 
@@ -91,6 +91,37 @@ public class ConversationsController : ControllerBase
         return NoContent();
     }
 
+    [Authorize]
+    [HttpPut("{id}/rename")]
+    public async Task<IActionResult> RenameConversation(Guid id, string newName)
+    {
+        var conversationToUpdate = await _context.Conversations.FirstOrDefaultAsync(c => c.Id == id && c.UserId == User.GetUserId());
+        if (conversationToUpdate == null)
+        {
+            return BadRequest();
+        }
+        conversationToUpdate.Name = newName;
+        conversationToUpdate.UpdatedAt = DateTime.UtcNow;
+        _context.Entry(conversationToUpdate).State = EntityState.Modified;
+
+        try
+        {
+            await _context.SaveChangesAsync();
+        }
+        catch (DbUpdateConcurrencyException)
+        {
+            if (!ConversationExists(id))
+            {
+                return NotFound();
+            }
+            else
+            {
+                throw;
+            }
+        }
+        return NoContent();
+    }
+
     [HttpPost]
     public async Task<ActionResult<Conversation>> PostConversation()
     {
@@ -108,10 +139,11 @@ public class ConversationsController : ControllerBase
         return CreatedAtAction("GetConversation", new { id = conversation.Id }, new ConversationCreated { Id = conversation.Id, Name = conversation.Name });
     }
 
+    [Authorize]
     [HttpDelete("{id}")]
     public async Task<IActionResult> DeleteConversation(Guid id)
     {
-        var conversation = await _context.Conversations.FindAsync(id);
+        var conversation = await _context.Conversations.FirstOrDefaultAsync(c => c.Id == id && c.UserId == User.GetUserId());
         if (conversation == null)
         {
             return NotFound();
