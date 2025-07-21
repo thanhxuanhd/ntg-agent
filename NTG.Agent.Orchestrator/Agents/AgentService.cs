@@ -1,5 +1,7 @@
-﻿using Microsoft.SemanticKernel;
+﻿using Microsoft.EntityFrameworkCore;
+using Microsoft.SemanticKernel;
 using Microsoft.SemanticKernel.Agents;
+using Microsoft.SemanticKernel.ChatCompletion;
 using NTG.Agent.Orchestrator.Data;
 using NTG.Agent.Orchestrator.Models.Chat;
 using NTG.Agent.Shared.Dtos.Chats;
@@ -16,6 +18,7 @@ public class AgentService : IAgentService
 {
     private readonly Kernel _kernel;
     private readonly AgentDbContext _agentDbContext;
+    private const int MAX_LATEST_MESSAGE_TO_KEEP_FULL = 5;
 
     public AgentService(Kernel kernel, AgentDbContext agentDbContext)
     {
@@ -30,60 +33,126 @@ public class AgentService : IAgentService
             Guid conversationId = promptRequest.ConversationId;
             var conversation = await _agentDbContext.Conversations.FindAsync(conversationId) ?? throw new InvalidOperationException($"Conversation with ID {conversationId} does not exist.");
 
-            ChatMessage userMessage = new()
-            {
-                UserId = userId.Value,
-                Conversation = conversation,
-                Content = promptRequest.Prompt,
-                Role = ChatRole.User,
-                CreatedAt = DateTime.UtcNow
-            };
+            List<ChatMessage> messagesToUse = await PrepareConversationHistory(userId, conversationId, conversation);
 
-            StringBuilder agentMessageSb = new StringBuilder();
-            await foreach (var item in InvokePromptStreamingInternalAsync(promptRequest.Prompt))
+            // Stream agent reply
+            var agentMessageSb = new StringBuilder();
+            await foreach (var item in InvokePromptStreamingInternalAsync(promptRequest.Prompt, messagesToUse))
             {
                 agentMessageSb.Append(item);
                 yield return item;
             }
 
+            // Rename conversation if unnamed
             if (conversation.Name == "New Conversation")
             {
                 conversation.Name = await GenerateConversationName(promptRequest.Prompt);
                 _agentDbContext.Conversations.Update(conversation);
             }
 
-            ChatMessage agentMessage = new()
+            var userMessage = new ChatMessage
+            {
+                UserId = userId.Value,
+                Conversation = conversation,
+                Content = promptRequest.Prompt,
+                Role = ChatRole.User
+            };
+
+            var assistantMessage = new ChatMessage
             {
                 UserId = userId.Value,
                 Conversation = conversation,
                 Content = agentMessageSb.ToString(),
-                Role = ChatRole.Assistant,
-                CreatedAt = DateTime.UtcNow
+                Role = ChatRole.Assistant
             };
-            _agentDbContext.ChatMessages.Add(userMessage);
-            _agentDbContext.ChatMessages.Add(agentMessage);
+
+            _agentDbContext.ChatMessages.AddRange(userMessage, assistantMessage);
             await _agentDbContext.SaveChangesAsync();
         }
         else
         {
-            await foreach (var item in InvokePromptStreamingInternalAsync(promptRequest.Prompt))
+            await foreach (var item in InvokePromptStreamingInternalAsync(promptRequest.Prompt, null))
             {
                 yield return item;
             }
         }
     }
 
-    private async IAsyncEnumerable<string> InvokePromptStreamingInternalAsync(string prompt)
+    private async Task<List<ChatMessage>> PrepareConversationHistory(Guid? userId, Guid conversationId, Conversation conversation)
     {
-        ChatCompletionAgent agent =
-            new()
+        var historyMessages = await _agentDbContext.ChatMessages
+            .Where(m => m.ConversationId == conversationId)
+            .OrderBy(m => m.UpdatedAt)
+            .ToListAsync();
+
+        if (historyMessages.Count > MAX_LATEST_MESSAGE_TO_KEEP_FULL)
+        {
+            var messagesToResummarize = historyMessages.Take(historyMessages.Count - MAX_LATEST_MESSAGE_TO_KEEP_FULL).ToList();
+            var newSummary = await SummarizeMessagesAsync(messagesToResummarize);
+            var summaryMessage = historyMessages.Where(m => m.IsSummary).FirstOrDefault();
+            if (summaryMessage == null)
             {
-                Name = "NTG-Assistant",
-                Instructions = @"Do not present speculation, deduction, or hallucination as fact.",
-                Kernel = _kernel,
-                Arguments = new KernelArguments(new PromptExecutionSettings() { FunctionChoiceBehavior = FunctionChoiceBehavior.Auto() })
-            };
-        var result = agent.InvokeStreamingAsync(prompt);
+                summaryMessage = new ChatMessage
+                {
+                    UserId = userId,
+                    Conversation = conversation,
+                    Content = $"Summary of earlier conversation: {newSummary}",
+                    Role = ChatRole.System,
+                    IsSummary = true
+                };
+                _agentDbContext.ChatMessages.Add(summaryMessage);
+            }
+            else
+            {
+                summaryMessage.Content = $"Summary of earlier conversation: {newSummary}";
+                summaryMessage.UpdatedAt = DateTime.UtcNow;
+                _agentDbContext.ChatMessages.Update(summaryMessage);
+            }
+
+            var optimizedHistoryMessages = new List<ChatMessage>();
+            optimizedHistoryMessages.Add(summaryMessage);
+            optimizedHistoryMessages.AddRange(historyMessages.TakeLast(MAX_LATEST_MESSAGE_TO_KEEP_FULL));
+            return optimizedHistoryMessages;
+        }
+        else
+        {
+            return historyMessages;
+        }
+    }
+
+    private async IAsyncEnumerable<string> InvokePromptStreamingInternalAsync(string prompt, List<ChatMessage>? previousMessages)
+    {
+        var messages = new List<ChatMessageContent>();
+        if (previousMessages is not null)
+        {
+            foreach (var msg in previousMessages.OrderBy(m => m.CreatedAt))
+            {
+                var role = msg.Role switch
+                {
+                    ChatRole.User => AuthorRole.User,
+                    ChatRole.Assistant => AuthorRole.Assistant,
+                    _ => AuthorRole.System
+                };
+                messages.Add(new ChatMessageContent(role, msg.Content));
+            }
+        }
+
+        messages.Add(new ChatMessageContent(AuthorRole.User, prompt));
+
+        var arguments = new KernelArguments(new PromptExecutionSettings
+        {
+            FunctionChoiceBehavior = FunctionChoiceBehavior.Auto()
+        });
+
+        ChatCompletionAgent agent = new()
+        {
+            Name = "NTG-Assistant",
+            Instructions = @"Do not present speculation, deduction, or hallucination as fact.",
+            Kernel = _kernel,
+            Arguments = arguments
+        };
+
+        var result = agent.InvokeStreamingAsync(messages);
         await foreach (var item in result)
         {
             yield return item.Message.ToString();
@@ -106,4 +175,36 @@ public class AgentService : IAgentService
         }
         return sb.ToString();
     }
+
+    private async Task<string> SummarizeMessagesAsync(List<ChatMessage> messages)
+    {
+        if (messages == null || messages.Count == 0) return string.Empty;
+
+        var chatHistory = new ChatHistory();
+        foreach (var msg in messages)
+        {
+            var role = msg.Role switch
+            {
+                ChatRole.User => AuthorRole.User,
+                ChatRole.Assistant => AuthorRole.Assistant,
+                _ => AuthorRole.System
+            };
+            chatHistory.AddMessage(role, msg.Content);
+        }
+
+        ChatCompletionAgent summarizer = new()
+        {
+            Name = "ConversationSummarizer",
+            Instructions = "Summarize the following chat into a concise paragraph that captures key points.",
+            Kernel = _kernel
+        };
+
+        var sb = new StringBuilder();
+        await foreach (var response in summarizer.InvokeAsync(chatHistory))
+        {
+            sb.Append(response.Message);
+        }
+        return sb.ToString();
+    }
+
 }
