@@ -31,6 +31,11 @@ public class DocumentClient(HttpClient httpClient)
         response.EnsureSuccessStatusCode();
     }
 
+    public async Task DeleteDocumentByIdAsync(Guid agentId, Guid documentId)
+    {
+        var response = await httpClient.DeleteAsync($"api/documents/{documentId}/{agentId}");
+        response.EnsureSuccessStatusCode();
+    }
     public async Task<string> ImportWebPageAsync(Guid agentId, string url)
     {
         var request = new { Url = url };

@@ -51,13 +51,13 @@ public class DocumentsController : ControllerBase
         {
             if (file.Length > 0)
             {
-                await _knowledgeService.ImportDocument(file.OpenReadStream(), file.FileName, agentId);
-
+                var knowledgeDocId = await _knowledgeService.ImportDocumentAsync(file.OpenReadStream(), file.FileName, agentId);
                 var document = new Document
                 {
                     Id = Guid.NewGuid(),
                     Name = file.FileName,
                     AgentId = agentId,
+                    KnowledgeDocId = knowledgeDocId,
                     CreatedByUserId = userId,
                     UpdatedByUserId = userId,
                     CreatedAt = DateTime.UtcNow,
@@ -77,6 +77,33 @@ public class DocumentsController : ControllerBase
         return Ok(new { message = "Files uploaded successfully." });
     }
 
+    [HttpDelete("{id}/{agentId}")]
+    [Authorize]
+    public async Task<IActionResult> DeleteDocument(Guid id, Guid agentId)
+    {
+        if (User.GetUserId() == null)
+        {
+            return Unauthorized();
+        }
+
+        var document = await _agentDbContext.Documents.FindAsync(id);
+
+        if (document == null)
+        {
+            return NotFound();
+        }
+
+        if (document.KnowledgeDocId!= null)
+        {
+            await _knowledgeService.RemoveDocumentAsync(document.KnowledgeDocId, agentId);
+        }
+
+        _agentDbContext.Documents.Remove(document);
+        await _agentDbContext.SaveChangesAsync();
+
+        return NoContent();
+    }
+    
     [HttpPost("import-webpage/{agentId}")]
     [Authorize]
     public async Task<IActionResult> ImportWebPage(Guid agentId, [FromBody] ImportWebPageRequest request)
@@ -97,6 +124,7 @@ public class DocumentsController : ControllerBase
                 Id = Guid.NewGuid(),
                 Name = request.Url,
                 AgentId = agentId,
+                KnowledgeDocId = documentId,
                 CreatedByUserId = userId,
                 UpdatedByUserId = userId,
                 CreatedAt = DateTime.UtcNow,
