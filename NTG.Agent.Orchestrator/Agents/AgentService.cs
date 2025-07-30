@@ -1,4 +1,5 @@
 ﻿using Microsoft.EntityFrameworkCore;
+using Microsoft.KernelMemory.Context;
 using Microsoft.SemanticKernel;
 using Microsoft.SemanticKernel.Agents;
 using Microsoft.SemanticKernel.ChatCompletion;
@@ -28,53 +29,68 @@ public class AgentService
 
     public async IAsyncEnumerable<string> ChatStreamingAsync(Guid? userId, PromptRequest promptRequest)
     {
+        var conversation = await ValidateConversation(userId, promptRequest);
+
+        List<ChatMessage> messagesToUse = await PrepareConversationHistory(userId, promptRequest.ConversationId, conversation);
+
+        var agentMessageSb = new StringBuilder();
+        await foreach (var item in InvokePromptStreamingInternalAsync(promptRequest.Prompt, messagesToUse))
+        {
+            agentMessageSb.Append(item);
+            yield return item;
+        }
+
+        // Rename conversation if unnamed
+        if (conversation.Name == "New Conversation")
+        {
+            conversation.Name = await GenerateConversationName(promptRequest.Prompt);
+            _agentDbContext.Conversations.Update(conversation);
+        }
+
+        var userMessage = new ChatMessage
+        {
+            UserId = userId,
+            Conversation = conversation,
+            Content = promptRequest.Prompt,
+            Role = ChatRole.User
+        };
+
+        var assistantMessage = new ChatMessage
+        {
+            UserId = userId,
+            Conversation = conversation,
+            Content = agentMessageSb.ToString(),
+            Role = ChatRole.Assistant
+        };
+
+        _agentDbContext.ChatMessages.AddRange(userMessage, assistantMessage);
+        await _agentDbContext.SaveChangesAsync();
+    }
+
+    private async Task<Conversation> ValidateConversation(Guid? userId, PromptRequest promptRequest)
+    {
+        Guid conversationId = promptRequest.ConversationId;
+        Conversation? conversation;
         if (userId.HasValue)
         {
-            Guid conversationId = promptRequest.ConversationId;
-            var conversation = await _agentDbContext.Conversations.FindAsync(conversationId) ?? throw new InvalidOperationException($"Conversation with ID {conversationId} does not exist.");
-
-            List<ChatMessage> messagesToUse = await PrepareConversationHistory(userId, conversationId, conversation);
-
-            var agentMessageSb = new StringBuilder();
-            await foreach (var item in InvokePromptStreamingInternalAsync(promptRequest.Prompt, messagesToUse))
-            {
-                agentMessageSb.Append(item);
-                yield return item;
-            }
-
-            // Rename conversation if unnamed
-            if (conversation.Name == "New Conversation")
-            {
-                conversation.Name = await GenerateConversationName(promptRequest.Prompt);
-                _agentDbContext.Conversations.Update(conversation);
-            }
-
-            var userMessage = new ChatMessage
-            {
-                UserId = userId.Value,
-                Conversation = conversation,
-                Content = promptRequest.Prompt,
-                Role = ChatRole.User
-            };
-
-            var assistantMessage = new ChatMessage
-            {
-                UserId = userId.Value,
-                Conversation = conversation,
-                Content = agentMessageSb.ToString(),
-                Role = ChatRole.Assistant
-            };
-
-            _agentDbContext.ChatMessages.AddRange(userMessage, assistantMessage);
-            await _agentDbContext.SaveChangesAsync();
+            conversation = await _agentDbContext.Conversations
+                .FirstOrDefaultAsync(c => c.Id == conversationId && c.UserId == userId);
         }
         else
         {
-            await foreach (var item in InvokePromptStreamingInternalAsync(promptRequest.Prompt, null))
+            if (!Guid.TryParse(promptRequest.SessionId, out Guid sessionId))
             {
-                yield return item;
+                throw new InvalidOperationException("A valid Session ID is required for unauthenticated requests.");
             }
+            conversation = await _agentDbContext.Conversations
+                .FirstOrDefaultAsync(c => c.Id == conversationId && c.SessionId == sessionId);
         }
+
+        if (conversation is null)
+        {
+            throw new InvalidOperationException($"Conversation with ID {conversationId} does not exist.");
+        }
+        return conversation;
     }
 
     private async Task<List<ChatMessage>> PrepareConversationHistory(Guid? userId, Guid conversationId, Conversation conversation)
@@ -136,19 +152,19 @@ public class AgentService
             }
         }
 
-        var prompt = $@"
-           Search to knowledge base: {message}
-           Knowledge base will answer: {{memory.search}}
-           If the answer is empty, continue answering with your knowledge and tools or plugins. Otherwise reply with the answer and include citations to the relevant information where it is referenced in the response";
-
-        chatHistory.AddMessage(AuthorRole.User, prompt);
-
         var arguments = new KernelArguments(new PromptExecutionSettings
         {
             FunctionChoiceBehavior = FunctionChoiceBehavior.Auto()
         });
 
         Kernel agentKernel = _kernel.Clone();
+
+        var prompt = $@"
+               Search to knowledge base: {message}
+               Knowledge base will answer: {{memory.search}}
+               If the answer is empty, continue answering with your knowledge and tools or plugins. Otherwise reply with the answer and include citations to the relevant information where it is referenced in the response";
+        chatHistory.AddMessage(AuthorRole.User, prompt);
+
         agentKernel.ImportPluginFromObject(new KnowledgePlugin(_knowledgeService), "memory");
 
         ChatCompletionAgent agent = new()
