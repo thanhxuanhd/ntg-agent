@@ -8,7 +8,7 @@ namespace NTG.Agent.Orchestrator.Controllers;
 
 [Route("api/[controller]")]
 [ApiController]
-[Authorize]
+[Authorize(Roles = "Admin")]
 public class AgentAdminController : ControllerBase
 {
     private readonly AgentDbContext _agentDbContext;
@@ -22,7 +22,7 @@ public class AgentAdminController : ControllerBase
     public async Task<IActionResult> GetAgents()
     {
         var agents = await _agentDbContext.Agents
-            .Select(x => new AgentListItem(x.Id, x.Name))
+            .Select(x => new AgentListItem(x.Id, x.Name, x.OwnerUser.Email, x.UpdatedByUser.Email, x.UpdatedAt))
             .ToListAsync();
         return Ok(agents);
     }
